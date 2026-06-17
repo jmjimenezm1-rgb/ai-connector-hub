@@ -117,7 +117,12 @@ const MOCK_RESPONSES = [
 ];
 
 export function AIManagerProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<State>(() => load());
+  const [state, setState] = useState<State>(DEFAULTS);
+
+  // Hydrate from localStorage AFTER first client render to avoid SSR mismatch.
+  useEffect(() => {
+    setState(load());
+  }, []);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -155,7 +160,7 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const runQuery = useCallback<Ctx["runQuery"]>(async ({ module, prompt, providerId }) => {
-    const id = `q_${Date.now()}`;
+    const id = `q_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     const provider = providerId ?? state.activeProvider ?? "chatgpt";
     const pending: QueryRecord = {
       id,
@@ -203,9 +208,59 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, prompts: s.prompts.filter((p) => p.id !== id) }));
   }, []);
 
+  const getPromptByModule = useCallback<Ctx["getPromptByModule"]>(
+    (mod) => state.prompts.find((p) => p.module.toLowerCase() === mod.toLowerCase()),
+    [state.prompts],
+  );
+
+  const runModule = useCallback<Ctx["runModule"]>(
+    async ({ module, input, fallbackPrompt, external, providerId }) => {
+      const existing = state.prompts.find((p) => p.module.toLowerCase() === module.toLowerCase());
+      let promptTemplate: PromptTemplate;
+      let registered = false;
+
+      if (existing) {
+        promptTemplate = existing;
+      } else {
+        const body =
+          fallbackPrompt && fallbackPrompt.trim().length > 0 ? fallbackPrompt : "{{input}}";
+        promptTemplate = {
+          id: `p_${Date.now()}`,
+          title: `Auto · ${module}`,
+          module,
+          body,
+          updatedAt: new Date().toISOString(),
+        };
+        registered = true;
+        setState((s) => ({ ...s, prompts: [promptTemplate, ...s.prompts] }));
+      }
+
+      const filled = promptTemplate.body.replace(/\{\{\s*input\s*\}\}/g, input ?? "");
+      const tag = external ? "Externa" : "Prueba";
+      const record = await runQuery({
+        module: `${tag} · ${module}`,
+        prompt: filled,
+        providerId,
+      });
+
+      return { ...record, registered, promptId: promptTemplate.id };
+    },
+    [state.prompts, runQuery],
+  );
+
   const value = useMemo<Ctx>(
-    () => ({ ...state, connect, disconnect, setActiveProvider, runQuery, upsertPrompt, deletePrompt }),
-    [state, connect, disconnect, setActiveProvider, runQuery, upsertPrompt, deletePrompt],
+    () => ({
+      ...state,
+      connect,
+      disconnect,
+      setActiveProvider,
+      runQuery,
+      runModule,
+      upsertPrompt,
+      deletePrompt,
+      getPromptByModule,
+    }),
+    [state, connect, disconnect, setActiveProvider, runQuery, runModule, upsertPrompt, deletePrompt, getPromptByModule],
   );
 
   return <AIContext.Provider value={value}>{children}</AIContext.Provider>;
