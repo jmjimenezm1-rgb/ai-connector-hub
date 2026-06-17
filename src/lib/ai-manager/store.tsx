@@ -51,13 +51,30 @@ interface State {
   prompts: PromptTemplate[];
 }
 
+interface RunModuleInput {
+  module: string;
+  input: string;
+  /** Prompt body to register if the module is not yet registered. May include {{input}}. */
+  fallbackPrompt?: string;
+  /** If true, simulates an external call (real mode). Otherwise, test mode. */
+  external?: boolean;
+  providerId?: AIProviderId;
+}
+
+interface RunModuleResult extends QueryRecord {
+  registered: boolean;
+  promptId: string;
+}
+
 interface Ctx extends State {
   connect: (providerId: AIProviderId, account: string, token: string) => void;
   disconnect: (providerId: AIProviderId) => void;
   setActiveProvider: (id: AIProviderId | null) => void;
   runQuery: (input: { module: string; prompt: string; providerId?: AIProviderId }) => Promise<QueryRecord>;
+  runModule: (input: RunModuleInput) => Promise<RunModuleResult>;
   upsertPrompt: (p: Omit<PromptTemplate, "id" | "updatedAt"> & { id?: string }) => PromptTemplate;
   deletePrompt: (id: string) => void;
+  getPromptByModule: (module: string) => PromptTemplate | undefined;
 }
 
 const STORAGE_KEY = "ai-manager-state-v1";
