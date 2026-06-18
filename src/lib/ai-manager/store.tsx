@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { generateAiResponse } from "./ai.functions";
 
 export type AIProviderId = "chatgpt" | "claude" | "gemini" | "copilot";
 export type ConnectionStatus = "active" | "pending" | "disconnected";
@@ -108,13 +109,6 @@ function load(): State {
     return DEFAULTS;
   }
 }
-
-const MOCK_RESPONSES = [
-  "Aquí tienes una respuesta sintetizada con los puntos clave que solicitaste, organizada de forma clara y accionable.",
-  "He procesado la información. Los insights principales sugieren tres oportunidades de mejora prioritarias.",
-  "Análisis completado. La tendencia indica un comportamiento positivo con margen de optimización en dos áreas.",
-  "Listo. Generé una versión refinada que mantiene tu intención original con mayor claridad expresiva.",
-];
 
 export function AIManagerProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<State>(DEFAULTS);
