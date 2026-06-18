@@ -169,12 +169,19 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, history: [pending, ...s.history].slice(0, 50) }));
 
     const start = Date.now();
-    await new Promise((r) => setTimeout(r, 900 + Math.random() * 900));
-    const response = MOCK_RESPONSES[Math.floor(Math.random() * MOCK_RESPONSES.length)];
+    let response = "";
+    let status: QueryRecord["status"] = "success";
+    try {
+      const { text } = await generateAiResponse({ data: { prompt } });
+      response = text;
+    } catch (err) {
+      status = "error";
+      response = err instanceof Error ? err.message : "Error desconocido al consultar la IA.";
+    }
     const finished: QueryRecord = {
       ...pending,
       response,
-      status: "success",
+      status,
       durationMs: Date.now() - start,
     };
     setState((s) => ({
