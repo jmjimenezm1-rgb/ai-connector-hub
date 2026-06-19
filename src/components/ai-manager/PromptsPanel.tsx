@@ -85,7 +85,7 @@ function PromptEditor({
 }: {
   prompt: PromptTemplate | null;
   onBack: () => void;
-  onSave: (data: { id?: string; title: string; module: string; body: string }) => void;
+  onSave: (data: { id?: string; title: string; module: string; body: string }) => void | Promise<void>;
 }) {
   const { runQuery } = useAIManager();
   const [title, setTitle] = useState(prompt?.title ?? "");
