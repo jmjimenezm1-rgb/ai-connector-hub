@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { supabase } from "@/integrations/supabase/client";
 import { generateAiResponse } from "./ai.functions";
 
 export type AIProviderId = "chatgpt" | "claude" | "gemini" | "copilot";
@@ -45,21 +46,14 @@ export interface PromptTemplate {
   updatedAt: string;
 }
 
-interface State {
-  connections: Connection[];
-  activeProvider: AIProviderId | null;
-  history: QueryRecord[];
-  prompts: PromptTemplate[];
-}
-
 interface RunModuleInput {
   module: string;
   input: string;
-  /** Prompt body to register if the module is not yet registered. May include {{input}}. */
   fallbackPrompt?: string;
-  /** If true, simulates an external call (real mode). Otherwise, test mode. */
   external?: boolean;
   providerId?: AIProviderId;
+  /** Optional extra named params replaced as {{name}} */
+  params?: Record<string, string>;
 }
 
 interface RunModuleResult extends QueryRecord {
@@ -67,106 +61,117 @@ interface RunModuleResult extends QueryRecord {
   promptId: string;
 }
 
-interface Ctx extends State {
-  connect: (providerId: AIProviderId, account: string, token: string) => void;
-  disconnect: (providerId: AIProviderId) => void;
+interface Ctx {
+  connections: Connection[];
+  activeProvider: AIProviderId | null;
+  history: QueryRecord[];
+  prompts: PromptTemplate[];
+  loading: boolean;
+  connect: (providerId: AIProviderId, account: string, token: string) => Promise<void>;
+  disconnect: (providerId: AIProviderId) => Promise<void>;
   setActiveProvider: (id: AIProviderId | null) => void;
   runQuery: (input: { module: string; prompt: string; providerId?: AIProviderId }) => Promise<QueryRecord>;
   runModule: (input: RunModuleInput) => Promise<RunModuleResult>;
-  upsertPrompt: (p: Omit<PromptTemplate, "id" | "updatedAt"> & { id?: string }) => PromptTemplate;
-  deletePrompt: (id: string) => void;
+  upsertPrompt: (p: Omit<PromptTemplate, "id" | "updatedAt"> & { id?: string }) => Promise<PromptTemplate>;
+  deletePrompt: (id: string) => Promise<void>;
   getPromptByModule: (module: string) => PromptTemplate | undefined;
 }
 
-const STORAGE_KEY = "ai-manager-state-v1";
-
-const DEFAULTS: State = {
-  connections: [
-    { providerId: "chatgpt", status: "active", account: "demo@user.io", tokenMask: "sk-••••a91f", connectedAt: new Date().toISOString() },
-    { providerId: "claude", status: "pending", account: "demo@user.io", tokenMask: "sk-••••3c2b", connectedAt: new Date().toISOString() },
-  ],
-  activeProvider: "chatgpt",
-  history: [
-    { id: "h1", module: "Resumen Documental", providerId: "chatgpt", prompt: "Resume el reporte trimestral", response: "El Q3 muestra un crecimiento del 12%...", status: "success", durationMs: 980, createdAt: new Date(Date.now() - 1000 * 60 * 8).toISOString() },
-    { id: "h2", module: "Análisis de Datos", providerId: "chatgpt", prompt: "Detecta anomalías en ventas", response: "Se identificaron 3 outliers en la región norte.", status: "success", durationMs: 1340, createdAt: new Date(Date.now() - 1000 * 60 * 22).toISOString() },
-  ],
-  prompts: [
-    { id: "p1", title: "Prompt para Resumen", module: "Resumen Documental", body: "Eres un asistente experto en sintetizar documentos. Resume el siguiente contenido en 5 puntos clave manteniendo el tono profesional:\n\n{{input}}", updatedAt: new Date().toISOString() },
-    { id: "p2", title: "Análisis de Datos", module: "Analítica", body: "Analiza los siguientes datos y entrega: 1) Insights principales, 2) Anomalías, 3) Recomendaciones accionables.\n\nDatos:\n{{input}}", updatedAt: new Date().toISOString() },
-    { id: "p3", title: "Generador de Emails", module: "CRM", body: "Redacta un email cordial y conciso al cliente con el siguiente contexto:\n\n{{input}}", updatedAt: new Date().toISOString() },
-  ],
-};
+const HISTORY_KEY = "ai-manager-history-v1";
+const ACTIVE_KEY = "ai-manager-active-v1";
 
 const AIContext = createContext<Ctx | null>(null);
 
-function load(): State {
-  if (typeof window === "undefined") return DEFAULTS;
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULTS;
-    return { ...DEFAULTS, ...JSON.parse(raw) };
-  } catch {
-    return DEFAULTS;
-  }
+function mask(token: string) {
+  return token.length > 6 ? `${token.slice(0, 3)}••••${token.slice(-4)}` : "••••••";
 }
 
 export function AIManagerProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<State>(DEFAULTS);
+  const [prompts, setPrompts] = useState<PromptTemplate[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [history, setHistory] = useState<QueryRecord[]>([]);
+  const [activeProvider, setActiveProviderState] = useState<AIProviderId | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  // Hydrate from localStorage AFTER first client render to avoid SSR mismatch.
-  useEffect(() => {
-    setState(load());
-  }, []);
-
+  // Hydrate
   useEffect(() => {
     if (typeof window !== "undefined") {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      try {
+        const h = localStorage.getItem(HISTORY_KEY);
+        if (h) setHistory(JSON.parse(h));
+        const a = localStorage.getItem(ACTIVE_KEY);
+        if (a) setActiveProviderState(a as AIProviderId);
+      } catch { /* ignore */ }
     }
-  }, [state]);
+    (async () => {
+      const [pRes, cRes] = await Promise.all([
+        supabase.from("ai_prompts").select("*").order("updated_at", { ascending: false }),
+        supabase.from("ai_connections").select("*"),
+      ]);
+      if (pRes.data) {
+        setPrompts(pRes.data.map((r) => ({
+          id: r.id, title: r.title, module: r.module, body: r.body, updatedAt: r.updated_at,
+        })));
+      }
+      if (cRes.data) {
+        setConnections(cRes.data.map((r) => ({
+          providerId: r.provider_id as AIProviderId,
+          status: r.status as ConnectionStatus,
+          account: r.account,
+          tokenMask: mask(r.api_key),
+          connectedAt: r.connected_at,
+        })));
+      }
+      setLoading(false);
+    })();
+  }, []);
 
-  const connect = useCallback((providerId: AIProviderId, account: string, token: string) => {
-    setState((s) => {
-      const tokenMask = token.length > 6 ? `${token.slice(0, 3)}••••${token.slice(-4)}` : "••••••";
-      const others = s.connections.filter((c) => c.providerId !== providerId);
-      return {
-        ...s,
-        connections: [
-          ...others,
-          { providerId, status: "active", account, tokenMask, connectedAt: new Date().toISOString() },
-        ],
-        activeProvider: providerId,
-      };
+  // Persist history + active provider
+  useEffect(() => {
+    if (typeof window !== "undefined") localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 50)));
+  }, [history]);
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      if (activeProvider) localStorage.setItem(ACTIVE_KEY, activeProvider);
+      else localStorage.removeItem(ACTIVE_KEY);
+    }
+  }, [activeProvider]);
+
+  const setActiveProvider = useCallback((id: AIProviderId | null) => setActiveProviderState(id), []);
+
+  const connect = useCallback(async (providerId: AIProviderId, account: string, token: string) => {
+    const { error } = await supabase.from("ai_connections").upsert({
+      provider_id: providerId,
+      account,
+      api_key: token,
+      status: "active",
+      connected_at: new Date().toISOString(),
     });
+    if (error) throw error;
+    setConnections((cs) => {
+      const others = cs.filter((c) => c.providerId !== providerId);
+      return [...others, {
+        providerId, status: "active", account, tokenMask: mask(token), connectedAt: new Date().toISOString(),
+      }];
+    });
+    setActiveProviderState(providerId);
   }, []);
 
-  const disconnect = useCallback((providerId: AIProviderId) => {
-    setState((s) => ({
-      ...s,
-      connections: s.connections.map((c) =>
-        c.providerId === providerId ? { ...c, status: "disconnected" } : c,
-      ),
-      activeProvider: s.activeProvider === providerId ? null : s.activeProvider,
-    }));
-  }, []);
-
-  const setActiveProvider = useCallback((id: AIProviderId | null) => {
-    setState((s) => ({ ...s, activeProvider: id }));
+  const disconnect = useCallback(async (providerId: AIProviderId) => {
+    const { error } = await supabase.from("ai_connections").delete().eq("provider_id", providerId);
+    if (error) throw error;
+    setConnections((cs) => cs.filter((c) => c.providerId !== providerId));
+    setActiveProviderState((cur) => (cur === providerId ? null : cur));
   }, []);
 
   const runQuery = useCallback<Ctx["runQuery"]>(async ({ module, prompt, providerId }) => {
     const id = `q_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    const provider = providerId ?? state.activeProvider ?? "chatgpt";
+    const provider = providerId ?? activeProvider ?? "chatgpt";
     const pending: QueryRecord = {
-      id,
-      module,
-      providerId: provider,
-      prompt,
-      response: "",
-      status: "pending",
-      durationMs: 0,
-      createdAt: new Date().toISOString(),
+      id, module, providerId: provider, prompt, response: "", status: "pending",
+      durationMs: 0, createdAt: new Date().toISOString(),
     };
-    setState((s) => ({ ...s, history: [pending, ...s.history].slice(0, 50) }));
+    setHistory((h) => [pending, ...h].slice(0, 50));
 
     const start = Date.now();
     let response = "";
@@ -178,90 +183,92 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
       status = "error";
       response = err instanceof Error ? err.message : "Error desconocido al consultar la IA.";
     }
-    const finished: QueryRecord = {
-      ...pending,
-      response,
-      status,
-      durationMs: Date.now() - start,
-    };
-    setState((s) => ({
-      ...s,
-      history: s.history.map((h) => (h.id === id ? finished : h)),
-    }));
+    const finished: QueryRecord = { ...pending, response, status, durationMs: Date.now() - start };
+    setHistory((h) => h.map((x) => (x.id === id ? finished : x)));
     return finished;
-  }, [state.activeProvider]);
+  }, [activeProvider]);
 
-  const upsertPrompt = useCallback<Ctx["upsertPrompt"]>((p) => {
-    const now = new Date().toISOString();
-    const id = p.id ?? `p_${Date.now()}`;
-    const next: PromptTemplate = { id, title: p.title, module: p.module, body: p.body, updatedAt: now };
-    setState((s) => {
-      const exists = s.prompts.some((x) => x.id === id);
-      return {
-        ...s,
-        prompts: exists ? s.prompts.map((x) => (x.id === id ? next : x)) : [next, ...s.prompts],
+  const upsertPrompt = useCallback<Ctx["upsertPrompt"]>(async (p) => {
+    if (p.id) {
+      const { data, error } = await supabase
+        .from("ai_prompts")
+        .update({ title: p.title, module: p.module, body: p.body })
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) throw error;
+      const next: PromptTemplate = {
+        id: data.id, title: data.title, module: data.module, body: data.body, updatedAt: data.updated_at,
       };
-    });
+      setPrompts((ps) => ps.map((x) => (x.id === next.id ? next : x)));
+      return next;
+    }
+    const { data, error } = await supabase
+      .from("ai_prompts")
+      .insert({ title: p.title, module: p.module, body: p.body })
+      .select()
+      .single();
+    if (error) throw error;
+    const next: PromptTemplate = {
+      id: data.id, title: data.title, module: data.module, body: data.body, updatedAt: data.updated_at,
+    };
+    setPrompts((ps) => [next, ...ps]);
     return next;
   }, []);
 
-  const deletePrompt = useCallback((id: string) => {
-    setState((s) => ({ ...s, prompts: s.prompts.filter((p) => p.id !== id) }));
+  const deletePrompt = useCallback(async (id: string) => {
+    const { error } = await supabase.from("ai_prompts").delete().eq("id", id);
+    if (error) throw error;
+    setPrompts((ps) => ps.filter((p) => p.id !== id));
   }, []);
 
   const getPromptByModule = useCallback<Ctx["getPromptByModule"]>(
-    (mod) => state.prompts.find((p) => p.module.toLowerCase() === mod.toLowerCase()),
-    [state.prompts],
+    (mod) => prompts.find((p) => p.module.toLowerCase() === mod.toLowerCase()),
+    [prompts],
   );
 
   const runModule = useCallback<Ctx["runModule"]>(
-    async ({ module, input, fallbackPrompt, external, providerId }) => {
-      const existing = state.prompts.find((p) => p.module.toLowerCase() === module.toLowerCase());
+    async ({ module, input, fallbackPrompt, external, providerId, params }) => {
+      const existing = prompts.find((p) => p.module.toLowerCase() === module.toLowerCase());
       let promptTemplate: PromptTemplate;
       let registered = false;
 
       if (existing) {
         promptTemplate = existing;
       } else {
-        const body =
-          fallbackPrompt && fallbackPrompt.trim().length > 0 ? fallbackPrompt : "{{input}}";
-        promptTemplate = {
-          id: `p_${Date.now()}`,
+        const body = fallbackPrompt && fallbackPrompt.trim() ? fallbackPrompt : "{{input}}";
+        promptTemplate = await upsertPrompt({
           title: `Auto · ${module}`,
           module,
           body,
-          updatedAt: new Date().toISOString(),
-        };
+        });
         registered = true;
-        setState((s) => ({ ...s, prompts: [promptTemplate, ...s.prompts] }));
       }
 
-      const filled = promptTemplate.body.replace(/\{\{\s*input\s*\}\}/g, input ?? "");
+      let filled = promptTemplate.body.replace(/\{\{\s*input\s*\}\}/g, input ?? "");
+      if (params) {
+        for (const [k, v] of Object.entries(params)) {
+          filled = filled.replace(new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, "g"), v);
+        }
+      }
       const tag = external ? "Externa" : "Prueba";
       const record = await runQuery({
         module: `${tag} · ${module}`,
         prompt: filled,
         providerId,
       });
-
       return { ...record, registered, promptId: promptTemplate.id };
     },
-    [state.prompts, runQuery],
+    [prompts, runQuery, upsertPrompt],
   );
 
   const value = useMemo<Ctx>(
     () => ({
-      ...state,
-      connect,
-      disconnect,
-      setActiveProvider,
-      runQuery,
-      runModule,
-      upsertPrompt,
-      deletePrompt,
-      getPromptByModule,
+      connections, activeProvider, history, prompts, loading,
+      connect, disconnect, setActiveProvider, runQuery, runModule,
+      upsertPrompt, deletePrompt, getPromptByModule,
     }),
-    [state, connect, disconnect, setActiveProvider, runQuery, runModule, upsertPrompt, deletePrompt, getPromptByModule],
+    [connections, activeProvider, history, prompts, loading, connect, disconnect, setActiveProvider, runQuery, runModule, upsertPrompt, deletePrompt, getPromptByModule],
   );
 
   return <AIContext.Provider value={value}>{children}</AIContext.Provider>;
