@@ -15,8 +15,8 @@ export function PromptsPanel() {
       <PromptEditor
         prompt={editing === "new" ? null : editing}
         onBack={() => setEditing(null)}
-        onSave={(data) => {
-          upsertPrompt(data);
+        onSave={async (data) => {
+          await upsertPrompt(data);
           setEditing(null);
         }}
       />
