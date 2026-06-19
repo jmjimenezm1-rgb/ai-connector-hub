@@ -245,11 +245,18 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
         registered = true;
       }
 
+      const hasInputPlaceholder = /\{\{\s*input\s*\}\}/.test(promptTemplate.body);
       let filled = promptTemplate.body.replace(/\{\{\s*input\s*\}\}/g, input ?? "");
       if (params) {
         for (const [k, v] of Object.entries(params)) {
           filled = filled.replace(new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, "g"), v);
         }
+      }
+      // If the template has no {{input}} placeholder, append the user's input
+      // as the actual data to process so the IA ejecuta la consulta en vez de
+      // pedir de nuevo los parámetros.
+      if (!hasInputPlaceholder && input && input.trim()) {
+        filled = `${filled}\n\n---\nDatos de entrada proporcionados por el usuario (úsalos directamente, NO vuelvas a pedirlos):\n${input}\n\nEjecuta ahora la consulta completa y devuelve el resultado final solicitado.`;
       }
       const tag = external ? "Externa" : "Prueba";
       const record = await runQuery({
