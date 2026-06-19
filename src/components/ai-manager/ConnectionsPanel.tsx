@@ -120,8 +120,11 @@ function ConnectModal({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLinking(true);
-    await new Promise((r) => setTimeout(r, 700));
-    onConfirm(account || "demo@user.io", token || "sk-demo-abcdef1234");
+    try {
+      await onConfirm(account || "demo@user.io", token || "sk-demo-abcdef1234");
+    } finally {
+      setLinking(false);
+    }
   };
 
   return (
