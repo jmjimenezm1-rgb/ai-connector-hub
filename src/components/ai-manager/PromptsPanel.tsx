@@ -15,8 +15,8 @@ export function PromptsPanel() {
       <PromptEditor
         prompt={editing === "new" ? null : editing}
         onBack={() => setEditing(null)}
-        onSave={(data) => {
-          upsertPrompt(data);
+        onSave={async (data) => {
+          await upsertPrompt(data);
           setEditing(null);
         }}
       />
@@ -85,7 +85,7 @@ function PromptEditor({
 }: {
   prompt: PromptTemplate | null;
   onBack: () => void;
-  onSave: (data: { id?: string; title: string; module: string; body: string }) => void;
+  onSave: (data: { id?: string; title: string; module: string; body: string }) => void | Promise<void>;
 }) {
   const { runQuery } = useAIManager();
   const [title, setTitle] = useState(prompt?.title ?? "");

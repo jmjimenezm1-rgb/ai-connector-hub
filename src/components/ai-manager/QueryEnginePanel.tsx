@@ -216,7 +216,7 @@ export function QueryEnginePanel() {
             </p>
             <Button
               type="submit"
-              disabled={loading || !activeConn || !effectiveModule || !input.trim()}
+              disabled={loading || !effectiveModule || !input.trim()}
             >
               {loading ? (
                 <Loader2 className="size-3.5 animate-spin" />

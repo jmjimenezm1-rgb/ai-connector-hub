@@ -93,8 +93,8 @@ export function ConnectionsPanel() {
         <ConnectModal
           provider={open}
           onClose={() => setOpen(null)}
-          onConfirm={(account, token) => {
-            connect(open.id, account, token);
+          onConfirm={async (account, token) => {
+            await connect(open.id, account, token);
             setOpen(null);
           }}
         />
@@ -110,7 +110,7 @@ function ConnectModal({
 }: {
   provider: AIProvider;
   onClose: () => void;
-  onConfirm: (account: string, token: string) => void;
+  onConfirm: (account: string, token: string) => void | Promise<void>;
 }) {
   const [account, setAccount] = useState("demo@user.io");
   const [token, setToken] = useState("");
@@ -120,8 +120,11 @@ function ConnectModal({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLinking(true);
-    await new Promise((r) => setTimeout(r, 700));
-    onConfirm(account || "demo@user.io", token || "sk-demo-abcdef1234");
+    try {
+      await onConfirm(account || "demo@user.io", token || "sk-demo-abcdef1234");
+    } finally {
+      setLinking(false);
+    }
   };
 
   return (
