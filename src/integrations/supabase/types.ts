@@ -14,7 +14,60 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      ai_connections: {
+        Row: {
+          account: string
+          api_key: string
+          connected_at: string
+          provider_id: string
+          status: string
+          updated_at: string
+        }
+        Insert: {
+          account: string
+          api_key: string
+          connected_at?: string
+          provider_id: string
+          status?: string
+          updated_at?: string
+        }
+        Update: {
+          account?: string
+          api_key?: string
+          connected_at?: string
+          provider_id?: string
+          status?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      ai_prompts: {
+        Row: {
+          body: string
+          created_at: string
+          id: string
+          module: string
+          title: string
+          updated_at: string
+        }
+        Insert: {
+          body: string
+          created_at?: string
+          id?: string
+          module: string
+          title: string
+          updated_at?: string
+        }
+        Update: {
+          body?: string
+          created_at?: string
+          id?: string
+          module?: string
+          title?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
