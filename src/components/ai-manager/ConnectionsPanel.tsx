@@ -110,7 +110,7 @@ function ConnectModal({
 }: {
   provider: AIProvider;
   onClose: () => void;
-  onConfirm: (account: string, token: string) => void;
+  onConfirm: (account: string, token: string) => void | Promise<void>;
 }) {
   const [account, setAccount] = useState("demo@user.io");
   const [token, setToken] = useState("");
