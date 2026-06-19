@@ -93,8 +93,8 @@ export function ConnectionsPanel() {
         <ConnectModal
           provider={open}
           onClose={() => setOpen(null)}
-          onConfirm={(account, token) => {
-            connect(open.id, account, token);
+          onConfirm={async (account, token) => {
+            await connect(open.id, account, token);
             setOpen(null);
           }}
         />
