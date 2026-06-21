@@ -156,7 +156,8 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
         providerId, status: "active", account, tokenMask: mask(token), connectedAt: new Date().toISOString(),
       }];
     });
-    setActiveProviderState(providerId);
+    const provider = AI_PROVIDERS.find((p) => p.id === providerId);
+    if (provider?.kind !== "search") setActiveProviderState(providerId);
   }, []);
 
   const disconnect = useCallback(async (providerId: AIProviderId) => {
