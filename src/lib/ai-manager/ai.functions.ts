@@ -147,8 +147,8 @@ export const generateAiResponse = createServerFn({ method: "POST" })
     const today = new Date().toISOString().slice(0, 10);
 
     // Instrumentación: registramos todas las llamadas reales a Firecrawl.
-    const calls: Array<{ tool: "search" | "scrape" | "map"; target: string; ok: boolean; error?: string }> = [];
-    const scrapedUrls = new Set<string>();
+    const calls: Array<{ tool: "search" | "scrape" | "map"; target: string; ok: boolean; bytes?: number; error?: string }> = [];
+    const liveScrapedUrls = new Set<string>(); // SOLO scrapes reales (no resultados de search)
     const searchedQueries = new Set<string>();
 
     const ensureKey = () => {
@@ -162,18 +162,21 @@ export const generateAiResponse = createServerFn({ method: "POST" })
 
     const system = `Eres un asistente con acceso a búsqueda y scraping web EN VIVO vía Firecrawl. Hoy es ${today}.
 
-REGLAS OBLIGATORIAS:
-1. Si la respuesta depende de información actual, externa, verificable o que pueda haber cambiado, DEBES usar las herramientas web (web_search, web_map, web_scrape). No respondas de memoria.
-2. Nunca describas lo que harías: ejecuta la herramienta. Cada afirmación factual debe estar respaldada por al menos un resultado real (search o scrape) de esta misma respuesta.
-3. Protocolo para portales con filtros (BOE/subastas BOE, BORME, AEAT, INE, sedes electrónicas, etc.):
-   a) Identifica el dominio oficial (p. ej. subastas.boe.es).
-   b) web_search con "site:dominio" + términos + tbs="qdr:w|d" si la consulta implica novedades.
-   c) web_map sobre el dominio con un "search" relevante para descubrir páginas reales.
-   d) Construye la URL del formulario con sus parámetros en query string y haz web_scrape directamente sobre esa URL.
-   e) web_scrape sobre cada URL prometedora (datos en vivo, sin caché).
-4. Si tras buscar no encuentras información válida, dilo explícitamente e indica qué URLs intentaste. Nunca inventes datos.
-5. Cita SIEMPRE las URLs reales consultadas al final en una sección "Fuentes" con enlaces. Si no usaste herramientas, indícalo explícitamente.
-6. Idioma de la respuesta: el del usuario (por defecto español).`;
+REGLAS OBLIGATORIAS (incumplirlas = respuesta inválida):
+1. Para cualquier dato externo, actual o verificable DEBES usar las herramientas (web_search, web_map, web_scrape). Nada de memoria.
+2. PROHIBIDO inventar cifras, totales, listados, fechas, nombres, precios o URLs. Todo dato concreto en tu respuesta debe aparecer literalmente en el "content" devuelto por al menos un web_scrape de esta misma respuesta. Si no lo tienes en un scrape, NO LO ESCRIBAS.
+3. Si un web_scrape devuelve "empty: true" o "contentLength" < 500, el scrape FRACASÓ (página vacía, JS no renderizado, login, error). NO lo trates como "0 resultados". Reintenta con otra URL/parámetros o con waitFor mayor (5000-10000 ms). Solo después de 2-3 intentos fallidos puedes declarar que no hay datos accesibles, y debes listar cada URL probada con su contentLength.
+4. Protocolo para portales con formularios (BOE/subastas BOE, BORME, AEAT, INE, sedes electrónicas):
+   a) Identifica el dominio oficial.
+   b) Construye la URL del buscador con los parámetros REALES del formulario en la query string.
+   c) Llama web_scrape con waitFor: 4000 sobre esa URL.
+   d) Para cada resultado, extrae el href de la ficha y haz web_scrape de la ficha individual.
+5. URL canónica del buscador del Portal de Subastas del BOE (subastas.boe.es):
+   https://subastas.boe.es/subastas_ava.php?accion=Buscar&dato[direccion]=&dato[localidad]=&dato[coddir3]=&dato[id_estado_array]=EJ&dato[id_tipo_subasta]=&dato[codigo_postal]=CP_AQUI&campo[0]=BIEN.LOCALIDAD&dato[0]=&campo[1]=BIEN.CODPOSTAL&dato[1]=CP_AQUI&campo[2]=SUBASTA.ESTADO&dato[2]=EJ&page_hits=50&sort_field[0]=SUBASTA.FECHA_FIN_YMD&sort_order[0]=desc
+   Estados: EJ = celebrándose, CE = celebrada/cerrada, AN = anunciada.
+   Sustituye CP_AQUI por el código postal. Si el primer intento devuelve poco contenido, prueba la versión simplificada: https://subastas.boe.es/subastas_ava.php?accion=Buscar&dato[codigo_postal]=CP_AQUI&dato[id_estado_array]=EJ
+6. Cierra con sección "Fuentes" listando solo las URLs que realmente scrapeaste con contenido > 500 chars.
+7. Idioma: español por defecto.`;
 
     try {
       const result = await generateText({
@@ -184,7 +187,7 @@ REGLAS OBLIGATORIAS:
         tools: {
           web_search: tool({
             description:
-              "Busca en la web en tiempo real vía Firecrawl. Acepta operadores: site:, comillas, -excluir. Usa tbs para frescura: qdr:h|d|w|m|y.",
+              "Busca en la web en tiempo real vía Firecrawl. Acepta operadores site:, comillas, -excluir. Usa tbs (qdr:h|d|w|m|y) para frescura. NOTA: los resultados de search NO equivalen a datos verificados; para usarlos en la respuesta debes después hacer web_scrape de la URL.",
             inputSchema: z.object({
               query: z.string(),
               limit: z.number().int().min(1).max(10).optional(),
@@ -198,8 +201,7 @@ REGLAS OBLIGATORIAS:
                 searchedQueries.add(query);
                 const results = await firecrawlSearch({ query, limit, tbs, lang, country }, k);
                 calls.push({ tool: "search", target: query, ok: true });
-                results.forEach((r) => r.url && scrapedUrls.add(r.url));
-                return { results };
+                return { results, note: "Estos snippets son referenciales. Para citar datos concretos, scrapea la URL." };
               } catch (e) {
                 const msg = e instanceof Error ? e.message : "search_failed";
                 calls.push({ tool: "search", target: query, ok: false, error: msg });
@@ -209,7 +211,7 @@ REGLAS OBLIGATORIAS:
           }),
           web_scrape: tool({
             description:
-              "Descarga el contenido principal de una URL EN VIVO (sin caché) vía Firecrawl. Úsala para portales con filtros: monta la URL con los parámetros en la query string y pásala aquí.",
+              "Descarga el contenido de una URL EN VIVO (sin caché) vía Firecrawl. Devuelve content, contentLength y empty. Si empty=true o contentLength<500, considera que el scrape FRACASÓ y reintenta con otra URL o waitFor mayor.",
             inputSchema: z.object({
               url: z.string().url(),
               waitFor: z.number().int().min(0).max(15000).optional(),
@@ -218,8 +220,8 @@ REGLAS OBLIGATORIAS:
               try {
                 const k = ensureKey();
                 const out = await firecrawlScrape(url, k, waitFor);
-                calls.push({ tool: "scrape", target: url, ok: true });
-                scrapedUrls.add(out.url);
+                calls.push({ tool: "scrape", target: url, ok: true, bytes: out.contentLength });
+                if (!out.empty) liveScrapedUrls.add(out.url);
                 return out;
               } catch (e) {
                 const msg = e instanceof Error ? e.message : "scrape_failed";
@@ -230,7 +232,7 @@ REGLAS OBLIGATORIAS:
           }),
           web_map: tool({
             description:
-              "Descubre URLs reales dentro de un dominio (sitemap rápido) vía Firecrawl. Útil antes de hacer scrape.",
+              "Descubre URLs reales dentro de un dominio (sitemap rápido) vía Firecrawl. Útil antes de scrape.",
             inputSchema: z.object({
               url: z.string().url(),
               search: z.string().optional(),
@@ -252,21 +254,38 @@ REGLAS OBLIGATORIAS:
         },
       });
 
-      // Anexar trazas de uso real de Firecrawl para que el usuario pueda verificar.
+      // Anexar trazas REALES (solo scrapes con contenido cuentan como datos en vivo).
+      const scrapeCalls = calls.filter((c) => c.tool === "scrape");
+      const scrapeOk = scrapeCalls.filter((c) => c.ok);
+      const scrapeEmpty = scrapeOk.filter((c) => (c.bytes ?? 0) < 500);
+      const scrapeUseful = scrapeOk.length - scrapeEmpty.length;
+
       let trace = "";
       if (calls.length === 0) {
         trace = firecrawlKey
-          ? "\n\n---\n⚠️ El modelo no invocó ninguna herramienta web en esta respuesta."
-          : "\n\n---\n⚠️ Firecrawl no está configurado: la respuesta no incluye datos en vivo. Conéctalo en Conexiones.";
+          ? "\n\n---\n⚠️ El modelo no invocó ninguna herramienta web. La respuesta NO contiene datos en vivo."
+          : "\n\n---\n⚠️ Firecrawl no está configurado. Conéctalo en Conexiones.";
       } else {
-        const ok = calls.filter((c) => c.ok).length;
-        const fail = calls.length - ok;
-        trace = `\n\n---\n🔎 Firecrawl: ${calls.length} llamada(s) (${ok} OK, ${fail} error). ${
-          searchedQueries.size
-        } búsqueda(s), ${scrapedUrls.size} URL(s) recuperadas en vivo.`;
+        const searchN = calls.filter((c) => c.tool === "search").length;
+        const mapN = calls.filter((c) => c.tool === "map").length;
+        trace = `\n\n---\n🔎 Firecrawl: ${searchN} search · ${mapN} map · ${scrapeCalls.length} scrape (${scrapeUseful} con contenido, ${scrapeEmpty.length} vacíos, ${scrapeCalls.length - scrapeOk.length} error).`;
+        if (scrapeCalls.length > 0) {
+          const detail = scrapeCalls
+            .map((c) => {
+              if (!c.ok) return `   ✗ ${c.target} → error: ${c.error ?? "?"}`;
+              const b = c.bytes ?? 0;
+              const flag = b < 500 ? "⚠ vacío" : `${b} chars`;
+              return `   ${b < 500 ? "○" : "●"} ${c.target} → ${flag}`;
+            })
+            .join("\n");
+          trace += `\n${detail}`;
+        }
+        if (scrapeUseful === 0 && scrapeCalls.length > 0) {
+          trace += `\n\n⚠️ Ningún scrape devolvió contenido útil. Cualquier dato concreto en la respuesta NO está verificado.`;
+        }
       }
 
-      return { text: result.text + trace, toolCalls: calls, scrapedUrls: [...scrapedUrls] };
+      return { text: result.text + trace, toolCalls: calls, scrapedUrls: [...liveScrapedUrls] };
     } catch (err: unknown) {
       const e = err as { statusCode?: number; status?: number; message?: string };
       const status = e.statusCode ?? e.status;
