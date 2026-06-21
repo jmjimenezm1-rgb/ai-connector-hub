@@ -8,6 +8,32 @@ const Input = z.object({
   model: z.string().optional(),
 });
 
+// Resuelve la API key de Firecrawl: 1) env (connector), 2) ai_connections en BD.
+let _firecrawlKeyCache: { value: string | null; at: number } | null = null;
+async function resolveFirecrawlKey(): Promise<string | null> {
+  const envKey = process.env.FIRECRAWL_API_KEY?.trim();
+  if (envKey) return envKey;
+  // Cache 30s para no golpear BD en cada tool call.
+  if (_firecrawlKeyCache && Date.now() - _firecrawlKeyCache.at < 30_000) {
+    return _firecrawlKeyCache.value;
+  }
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await supabaseAdmin
+      .from("ai_connections")
+      .select("api_key,status")
+      .eq("provider_id", "firecrawl")
+      .eq("status", "active")
+      .maybeSingle();
+    const value = (data?.api_key as string | undefined)?.trim() || null;
+    _firecrawlKeyCache = { value, at: Date.now() };
+    return value;
+  } catch {
+    _firecrawlKeyCache = { value: null, at: Date.now() };
+    return null;
+  }
+}
+
 type SearchOpts = {
   query: string;
   limit?: number;
@@ -17,9 +43,7 @@ type SearchOpts = {
   scrape?: boolean;
 };
 
-async function firecrawlSearch(opts: SearchOpts) {
-  const key = process.env.FIRECRAWL_API_KEY;
-  if (!key) throw new Error("FIRECRAWL_API_KEY no configurada.");
+async function firecrawlSearch(opts: SearchOpts, key: string) {
   const body: Record<string, unknown> = {
     query: opts.query,
     limit: opts.limit ?? 5,
@@ -56,9 +80,7 @@ async function firecrawlSearch(opts: SearchOpts) {
   }));
 }
 
-async function firecrawlScrape(url: string, waitFor?: number) {
-  const key = process.env.FIRECRAWL_API_KEY;
-  if (!key) throw new Error("FIRECRAWL_API_KEY no configurada.");
+async function firecrawlScrape(url: string, key: string, waitFor?: number) {
   const res = await fetch("https://api.firecrawl.dev/v2/scrape", {
     method: "POST",
     headers: {
@@ -69,7 +91,7 @@ async function firecrawlScrape(url: string, waitFor?: number) {
       url,
       formats: ["markdown"],
       onlyMainContent: true,
-      maxAge: 0, // fuerza fetch en vivo, evita caché
+      maxAge: 0,
       waitFor: waitFor ?? 0,
     }),
   });
@@ -89,9 +111,7 @@ async function firecrawlScrape(url: string, waitFor?: number) {
   };
 }
 
-async function firecrawlMap(url: string, search?: string, limit = 50) {
-  const key = process.env.FIRECRAWL_API_KEY;
-  if (!key) throw new Error("FIRECRAWL_API_KEY no configurada.");
+async function firecrawlMap(url: string, key: string, search?: string, limit = 50) {
   const body: Record<string, unknown> = { url, limit, includeSubdomains: false };
   if (search) body.search = search;
   const res = await fetch("https://api.firecrawl.dev/v2/map", {
@@ -117,24 +137,41 @@ export const generateAiResponse = createServerFn({ method: "POST" })
     if (!key) {
       throw new Error("Falta LOVABLE_API_KEY en el servidor.");
     }
+    const firecrawlKey = await resolveFirecrawlKey();
     const gateway = createLovableAiGatewayProvider(key);
     const today = new Date().toISOString().slice(0, 10);
-    const system = `Eres un asistente con acceso a búsqueda web en tiempo real. Hoy es ${today}.
 
-REGLAS DE BÚSQUEDA (obligatorias):
-1. Para cualquier información actual, reciente o verificable usa SIEMPRE las herramientas web.
-2. Si el usuario nombra un portal concreto (BOE, subastas BOE, BORME, AEAT, INE, registros oficiales, sedes electrónicas, marketplaces, etc.) NO uses búsqueda genérica de Google sola. Sigue este protocolo:
-   a) Identifica el dominio oficial (p. ej. subastas.boe.es, www.boe.es).
-   b) Usa web_search con "site:dominio" + términos del usuario y tbs="qdr:w" o "qdr:d" si la consulta implica novedades.
-   c) Usa web_map sobre el dominio con un "search" relevante para descubrir páginas reales (listados, fichas).
-   d) Para cada URL prometedora usa web_scrape (fuerza datos en vivo, sin caché) y extrae los campos pedidos.
-   e) Si una página requiere filtros (formulario GET), construye tú la URL con los parámetros en la query string y haz scrape directo de la URL resultante. Ejemplo BOE subastas: https://subastas.boe.es/subastas_ava.php?campo[...]=...
-3. Nunca inventes resultados ni respondas con datos de entrenamiento si la consulta puede haber cambiado. Si tras buscar no encuentras información válida, dilo explícitamente y muestra qué URLs intentaste.
-4. Cita SIEMPRE las URLs reales consultadas al final, en una sección "Fuentes".
-5. Idioma de la respuesta: el del usuario (por defecto español).`;
+    // Instrumentación: registramos todas las llamadas reales a Firecrawl.
+    const calls: Array<{ tool: "search" | "scrape" | "map"; target: string; ok: boolean; error?: string }> = [];
+    const scrapedUrls = new Set<string>();
+    const searchedQueries = new Set<string>();
+
+    const ensureKey = () => {
+      if (!firecrawlKey) {
+        throw new Error(
+          "Firecrawl no está configurado. Conéctalo en el panel de Conexiones para habilitar la búsqueda y scraping en vivo.",
+        );
+      }
+      return firecrawlKey;
+    };
+
+    const system = `Eres un asistente con acceso a búsqueda y scraping web EN VIVO vía Firecrawl. Hoy es ${today}.
+
+REGLAS OBLIGATORIAS:
+1. Si la respuesta depende de información actual, externa, verificable o que pueda haber cambiado, DEBES usar las herramientas web (web_search, web_map, web_scrape). No respondas de memoria.
+2. Nunca describas lo que harías: ejecuta la herramienta. Cada afirmación factual debe estar respaldada por al menos un resultado real (search o scrape) de esta misma respuesta.
+3. Protocolo para portales con filtros (BOE/subastas BOE, BORME, AEAT, INE, sedes electrónicas, etc.):
+   a) Identifica el dominio oficial (p. ej. subastas.boe.es).
+   b) web_search con "site:dominio" + términos + tbs="qdr:w|d" si la consulta implica novedades.
+   c) web_map sobre el dominio con un "search" relevante para descubrir páginas reales.
+   d) Construye la URL del formulario con sus parámetros en query string y haz web_scrape directamente sobre esa URL.
+   e) web_scrape sobre cada URL prometedora (datos en vivo, sin caché).
+4. Si tras buscar no encuentras información válida, dilo explícitamente e indica qué URLs intentaste. Nunca inventes datos.
+5. Cita SIEMPRE las URLs reales consultadas al final en una sección "Fuentes" con enlaces. Si no usaste herramientas, indícalo explícitamente.
+6. Idioma de la respuesta: el del usuario (por defecto español).`;
 
     try {
-      const { text } = await generateText({
+      const result = await generateText({
         model: gateway(data.model ?? "google/gemini-3-flash-preview"),
         system,
         prompt: data.prompt,
@@ -142,64 +179,89 @@ REGLAS DE BÚSQUEDA (obligatorias):
         tools: {
           web_search: tool({
             description:
-              "Busca en la web en tiempo real (Google). Acepta operadores como site:, comillas y -excluir. Usa tbs para filtrar por tiempo: qdr:h (hora), qdr:d (día), qdr:w (semana), qdr:m (mes), qdr:y (año).",
+              "Busca en la web en tiempo real vía Firecrawl. Acepta operadores: site:, comillas, -excluir. Usa tbs para frescura: qdr:h|d|w|m|y.",
             inputSchema: z.object({
-              query: z.string().describe("Consulta. Usa site:dominio para acotar a un portal."),
+              query: z.string(),
               limit: z.number().int().min(1).max(10).optional(),
-              tbs: z.string().optional().describe("Filtro temporal: qdr:h|d|w|m|y"),
-              lang: z.string().optional().describe("Idioma, p. ej. 'es'"),
-              country: z.string().optional().describe("País, p. ej. 'es'"),
+              tbs: z.string().optional(),
+              lang: z.string().optional(),
+              country: z.string().optional(),
             }),
             execute: async ({ query, limit, tbs, lang, country }) => {
               try {
-                return {
-                  results: await firecrawlSearch({ query, limit, tbs, lang, country }),
-                };
+                const k = ensureKey();
+                searchedQueries.add(query);
+                const results = await firecrawlSearch({ query, limit, tbs, lang, country }, k);
+                calls.push({ tool: "search", target: query, ok: true });
+                results.forEach((r) => r.url && scrapedUrls.add(r.url));
+                return { results };
               } catch (e) {
-                return { error: e instanceof Error ? e.message : "search_failed" };
+                const msg = e instanceof Error ? e.message : "search_failed";
+                calls.push({ tool: "search", target: query, ok: false, error: msg });
+                return { error: msg };
               }
             },
           }),
           web_scrape: tool({
             description:
-              "Descarga el contenido principal de una URL concreta en markdown, en vivo (sin caché). Úsala para portales con filtros: construye la URL con los parámetros del formulario en la query string y pásala aquí.",
+              "Descarga el contenido principal de una URL EN VIVO (sin caché) vía Firecrawl. Úsala para portales con filtros: monta la URL con los parámetros en la query string y pásala aquí.",
             inputSchema: z.object({
               url: z.string().url(),
-              waitFor: z
-                .number()
-                .int()
-                .min(0)
-                .max(15000)
-                .optional()
-                .describe("Milisegundos para esperar a contenido dinámico"),
+              waitFor: z.number().int().min(0).max(15000).optional(),
             }),
             execute: async ({ url, waitFor }) => {
               try {
-                return await firecrawlScrape(url, waitFor);
+                const k = ensureKey();
+                const out = await firecrawlScrape(url, k, waitFor);
+                calls.push({ tool: "scrape", target: url, ok: true });
+                scrapedUrls.add(out.url);
+                return out;
               } catch (e) {
-                return { error: e instanceof Error ? e.message : "scrape_failed" };
+                const msg = e instanceof Error ? e.message : "scrape_failed";
+                calls.push({ tool: "scrape", target: url, ok: false, error: msg });
+                return { error: msg };
               }
             },
           }),
           web_map: tool({
             description:
-              "Descubre URLs reales dentro de un dominio (sitemap rápido). Útil para localizar páginas de listado o fichas en portales oficiales antes de hacer scrape.",
+              "Descubre URLs reales dentro de un dominio (sitemap rápido) vía Firecrawl. Útil antes de hacer scrape.",
             inputSchema: z.object({
-              url: z.string().url().describe("Dominio raíz, p. ej. https://subastas.boe.es"),
-              search: z.string().optional().describe("Filtra los enlaces por palabra clave"),
+              url: z.string().url(),
+              search: z.string().optional(),
               limit: z.number().int().min(1).max(200).optional(),
             }),
             execute: async ({ url, search, limit }) => {
               try {
-                return await firecrawlMap(url, search, limit ?? 50);
+                const k = ensureKey();
+                const out = await firecrawlMap(url, k, search, limit ?? 50);
+                calls.push({ tool: "map", target: url, ok: true });
+                return out;
               } catch (e) {
-                return { error: e instanceof Error ? e.message : "map_failed" };
+                const msg = e instanceof Error ? e.message : "map_failed";
+                calls.push({ tool: "map", target: url, ok: false, error: msg });
+                return { error: msg };
               }
             },
           }),
         },
       });
-      return { text };
+
+      // Anexar trazas de uso real de Firecrawl para que el usuario pueda verificar.
+      let trace = "";
+      if (calls.length === 0) {
+        trace = firecrawlKey
+          ? "\n\n---\n⚠️ El modelo no invocó ninguna herramienta web en esta respuesta."
+          : "\n\n---\n⚠️ Firecrawl no está configurado: la respuesta no incluye datos en vivo. Conéctalo en Conexiones.";
+      } else {
+        const ok = calls.filter((c) => c.ok).length;
+        const fail = calls.length - ok;
+        trace = `\n\n---\n🔎 Firecrawl: ${calls.length} llamada(s) (${ok} OK, ${fail} error). ${
+          searchedQueries.size
+        } búsqueda(s), ${scrapedUrls.size} URL(s) recuperadas en vivo.`;
+      }
+
+      return { text: result.text + trace, toolCalls: calls, scrapedUrls: [...scrapedUrls] };
     } catch (err: unknown) {
       const e = err as { statusCode?: number; status?: number; message?: string };
       const status = e.statusCode ?? e.status;
