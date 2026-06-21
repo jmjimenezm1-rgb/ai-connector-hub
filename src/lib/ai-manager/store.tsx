@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { supabase } from "@/integrations/supabase/client";
 import { generateAiResponse } from "./ai.functions";
 
-export type AIProviderId = "chatgpt" | "claude" | "gemini" | "copilot";
+export type AIProviderId = "chatgpt" | "claude" | "gemini" | "copilot" | "firecrawl";
 export type ConnectionStatus = "active" | "pending" | "disconnected";
 
 export interface AIProvider {
@@ -10,13 +10,15 @@ export interface AIProvider {
   name: string;
   tagline: string;
   accent: string;
+  kind?: "llm" | "search";
 }
 
 export const AI_PROVIDERS: AIProvider[] = [
-  { id: "chatgpt", name: "ChatGPT", tagline: "OpenAI · GPT-4o", accent: "oklch(0.72 0.15 155)" },
-  { id: "claude", name: "Claude", tagline: "Anthropic · Sonnet", accent: "oklch(0.7 0.17 50)" },
-  { id: "gemini", name: "Gemini", tagline: "Google · 1.5 Pro", accent: "oklch(0.65 0.18 250)" },
-  { id: "copilot", name: "Copilot", tagline: "Microsoft · GPT-4", accent: "oklch(0.7 0.15 200)" },
+  { id: "chatgpt", name: "ChatGPT", tagline: "OpenAI · GPT-4o", accent: "oklch(0.72 0.15 155)", kind: "llm" },
+  { id: "claude", name: "Claude", tagline: "Anthropic · Sonnet", accent: "oklch(0.7 0.17 50)", kind: "llm" },
+  { id: "gemini", name: "Gemini", tagline: "Google · 1.5 Pro", accent: "oklch(0.65 0.18 250)", kind: "llm" },
+  { id: "copilot", name: "Copilot", tagline: "Microsoft · GPT-4", accent: "oklch(0.7 0.15 200)", kind: "llm" },
+  { id: "firecrawl", name: "Firecrawl", tagline: "Búsqueda y scraping web en vivo", accent: "oklch(0.7 0.2 35)", kind: "search" },
 ];
 
 export interface Connection {
@@ -154,7 +156,8 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
         providerId, status: "active", account, tokenMask: mask(token), connectedAt: new Date().toISOString(),
       }];
     });
-    setActiveProviderState(providerId);
+    const provider = AI_PROVIDERS.find((p) => p.id === providerId);
+    if (provider?.kind !== "search") setActiveProviderState(providerId);
   }, []);
 
   const disconnect = useCallback(async (providerId: AIProviderId) => {

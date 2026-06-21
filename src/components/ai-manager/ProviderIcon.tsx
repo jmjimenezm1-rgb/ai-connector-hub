@@ -46,5 +46,13 @@ export function ProviderIcon({ id, className, size = 24 }: Props) {
           <circle cx="19" cy="17.5" r="1.2" fill="oklch(0.7 0.15 200)" />
         </svg>
       );
+    case "firecrawl":
+      return (
+        <svg {...common}>
+          <rect width="32" height="32" rx="14" fill="oklch(0.7 0.2 35)" />
+          <path d="M16 6c1 3 4 4 4 8a4 4 0 01-8 0c0-2 1-3 2-4-1 4 2 4 2 1 0-2 0-3 0-5z" fill="white" />
+          <path d="M11 22h10v2H11z" fill="white" opacity="0.85" />
+        </svg>
+      );
   }
 }

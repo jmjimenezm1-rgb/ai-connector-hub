@@ -66,14 +66,20 @@ export function ConnectionsPanel() {
               <div className="mt-4 flex flex-wrap gap-2">
                 {status === "active" ? (
                   <>
-                    <Button
-                      size="sm"
-                      variant={isActive ? "default" : "outline"}
-                      onClick={() => setActiveProvider(p.id)}
-                      className="flex-1"
-                    >
-                      {isActive ? (<><Check className="size-3.5" /> Activo</>) : "Usar"}
-                    </Button>
+                    {p.kind === "search" ? (
+                      <span className="flex-1 inline-flex items-center justify-center rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground">
+                        Activa para búsqueda web
+                      </span>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant={isActive ? "default" : "outline"}
+                        onClick={() => setActiveProvider(p.id)}
+                        className="flex-1"
+                      >
+                        {isActive ? (<><Check className="size-3.5" /> Activo</>) : "Usar"}
+                      </Button>
+                    )}
                     <Button size="sm" variant="ghost" onClick={() => disconnect(p.id)} aria-label={`Desconectar ${p.name}`}>
                       <LogOut className="size-3.5" />
                     </Button>
