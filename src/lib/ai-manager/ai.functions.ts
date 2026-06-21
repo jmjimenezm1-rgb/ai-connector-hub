@@ -90,9 +90,10 @@ async function firecrawlScrape(url: string, key: string, waitFor?: number) {
     body: JSON.stringify({
       url,
       formats: ["markdown"],
-      onlyMainContent: true,
+      onlyMainContent: false,
       maxAge: 0,
-      waitFor: waitFor ?? 0,
+      waitFor: waitFor ?? 2500,
+      timeout: 45000,
     }),
   });
   if (!res.ok) {
@@ -100,14 +101,18 @@ async function firecrawlScrape(url: string, key: string, waitFor?: number) {
     throw new Error(`Firecrawl scrape ${res.status}: ${text.slice(0, 200)}`);
   }
   const json = (await res.json()) as {
-    data?: { markdown?: string; metadata?: { title?: string; sourceURL?: string } };
+    data?: { markdown?: string; metadata?: { title?: string; sourceURL?: string; statusCode?: number } };
     markdown?: string;
   };
   const md = json.data?.markdown ?? json.markdown ?? "";
+  const trimmed = md.trim();
   return {
     url: json.data?.metadata?.sourceURL ?? url,
     title: json.data?.metadata?.title,
-    content: md.slice(0, 12000),
+    statusCode: json.data?.metadata?.statusCode,
+    contentLength: trimmed.length,
+    empty: trimmed.length < 500,
+    content: md.slice(0, 16000),
   };
 }
 
