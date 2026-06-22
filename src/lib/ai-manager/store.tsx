@@ -21,12 +21,30 @@ export const AI_PROVIDERS: AIProvider[] = [
   { id: "firecrawl", name: "Firecrawl", tagline: "Búsqueda y scraping web en vivo", accent: "oklch(0.7 0.2 35)", kind: "search" },
 ];
 
+/** Mapeo proveedor → modelo en Lovable AI Gateway (para fallback automático). */
+export const PROVIDER_MODEL: Record<AIProviderId, string | null> = {
+  chatgpt: "openai/gpt-5-mini",
+  claude: "anthropic/claude-sonnet-4-5",
+  gemini: "google/gemini-3-flash-preview",
+  copilot: "openai/gpt-5",
+  firecrawl: null,
+};
+
+export const FIRECRAWL_MAX_KEYS = 3;
+
+export interface FirecrawlKey {
+  account: string;
+  tokenMask: string;
+}
+
 export interface Connection {
   providerId: AIProviderId;
   status: ConnectionStatus;
   account: string;
   tokenMask: string;
   connectedAt: string;
+  /** Solo para firecrawl: lista de keys configuradas (hasta 3). */
+  firecrawlKeys?: FirecrawlKey[];
 }
 
 export interface QueryRecord {
@@ -54,7 +72,6 @@ interface RunModuleInput {
   fallbackPrompt?: string;
   external?: boolean;
   providerId?: AIProviderId;
-  /** Optional extra named params replaced as {{name}} */
   params?: Record<string, string>;
 }
 
@@ -70,6 +87,9 @@ interface Ctx {
   prompts: PromptTemplate[];
   loading: boolean;
   connect: (providerId: AIProviderId, account: string, token: string) => Promise<void>;
+  /** Para firecrawl: añade una key adicional (hasta 3). Para otros: equivalente a connect. */
+  addFirecrawlKey: (account: string, token: string) => Promise<void>;
+  removeFirecrawlKey: (account: string) => Promise<void>;
   disconnect: (providerId: AIProviderId) => Promise<void>;
   setActiveProvider: (id: AIProviderId | null) => void;
   runQuery: (input: { module: string; prompt: string; providerId?: AIProviderId }) => Promise<QueryRecord>;
@@ -86,6 +106,21 @@ const AIContext = createContext<Ctx | null>(null);
 
 function mask(token: string) {
   return token.length > 6 ? `${token.slice(0, 3)}••••${token.slice(-4)}` : "••••••";
+}
+
+/** Lee el campo api_key de firecrawl: puede ser JSON-array o string plano (compat). */
+function parseFirecrawlPayload(apiKey: string): Array<{ account: string; token: string }> {
+  try {
+    const parsed = JSON.parse(apiKey);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((x) => x && typeof x.token === "string" && x.token.trim())
+        .map((x) => ({ account: String(x.account ?? "key"), token: String(x.token) }));
+    }
+  } catch {
+    /* not JSON */
+  }
+  return apiKey.trim() ? [{ account: "primary", token: apiKey }] : [];
 }
 
 export function AIManagerProvider({ children }: { children: ReactNode }) {
@@ -116,19 +151,32 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
         })));
       }
       if (cRes.data) {
-        setConnections(cRes.data.map((r) => ({
-          providerId: r.provider_id as AIProviderId,
-          status: r.status as ConnectionStatus,
-          account: r.account,
-          tokenMask: mask(r.api_key),
-          connectedAt: r.connected_at,
-        })));
+        setConnections(cRes.data.map((r) => {
+          const pid = r.provider_id as AIProviderId;
+          if (pid === "firecrawl") {
+            const keys = parseFirecrawlPayload(r.api_key);
+            return {
+              providerId: pid,
+              status: r.status as ConnectionStatus,
+              account: keys[0]?.account ?? r.account,
+              tokenMask: keys.length > 1 ? `${keys.length} keys` : mask(keys[0]?.token ?? ""),
+              connectedAt: r.connected_at,
+              firecrawlKeys: keys.map((k) => ({ account: k.account, tokenMask: mask(k.token) })),
+            };
+          }
+          return {
+            providerId: pid,
+            status: r.status as ConnectionStatus,
+            account: r.account,
+            tokenMask: mask(r.api_key),
+            connectedAt: r.connected_at,
+          };
+        }));
       }
       setLoading(false);
     })();
   }, []);
 
-  // Persist history + active provider
   useEffect(() => {
     if (typeof window !== "undefined") localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 50)));
   }, [history]);
@@ -141,7 +189,54 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
 
   const setActiveProvider = useCallback((id: AIProviderId | null) => setActiveProviderState(id), []);
 
+  /** Lee las keys actuales de firecrawl desde la BD. */
+  const fetchFirecrawlKeys = useCallback(async (): Promise<Array<{ account: string; token: string }>> => {
+    const { data } = await supabase
+      .from("ai_connections")
+      .select("api_key")
+      .eq("provider_id", "firecrawl")
+      .maybeSingle();
+    if (!data?.api_key) return [];
+    return parseFirecrawlPayload(data.api_key);
+  }, []);
+
+  const persistFirecrawl = useCallback(
+    async (keys: Array<{ account: string; token: string }>) => {
+      if (keys.length === 0) {
+        await supabase.from("ai_connections").delete().eq("provider_id", "firecrawl");
+        setConnections((cs) => cs.filter((c) => c.providerId !== "firecrawl"));
+        return;
+      }
+      const payload = JSON.stringify(keys);
+      const { error } = await supabase.from("ai_connections").upsert({
+        provider_id: "firecrawl",
+        account: keys[0].account,
+        api_key: payload,
+        status: "active",
+        connected_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      setConnections((cs) => {
+        const others = cs.filter((c) => c.providerId !== "firecrawl");
+        return [...others, {
+          providerId: "firecrawl",
+          status: "active",
+          account: keys[0].account,
+          tokenMask: keys.length > 1 ? `${keys.length} keys` : mask(keys[0].token),
+          connectedAt: new Date().toISOString(),
+          firecrawlKeys: keys.map((k) => ({ account: k.account, tokenMask: mask(k.token) })),
+        }];
+      });
+    },
+    [],
+  );
+
   const connect = useCallback(async (providerId: AIProviderId, account: string, token: string) => {
+    if (providerId === "firecrawl") {
+      // Reemplaza el set de keys con una única key (uso "Conectar" inicial).
+      await persistFirecrawl([{ account, token }]);
+      return;
+    }
     const { error } = await supabase.from("ai_connections").upsert({
       provider_id: providerId,
       account,
@@ -156,9 +251,26 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
         providerId, status: "active", account, tokenMask: mask(token), connectedAt: new Date().toISOString(),
       }];
     });
-    const provider = AI_PROVIDERS.find((p) => p.id === providerId);
-    if (provider?.kind !== "search") setActiveProviderState(providerId);
-  }, []);
+    setActiveProviderState(providerId);
+  }, [persistFirecrawl]);
+
+  const addFirecrawlKey = useCallback(async (account: string, token: string) => {
+    const current = await fetchFirecrawlKeys();
+    if (current.length >= FIRECRAWL_MAX_KEYS) {
+      throw new Error(`Máximo ${FIRECRAWL_MAX_KEYS} API keys de Firecrawl.`);
+    }
+    if (current.some((k) => k.token === token)) {
+      throw new Error("Esa API key ya está registrada.");
+    }
+    const label = account?.trim() || `key-${current.length + 1}`;
+    await persistFirecrawl([...current, { account: label, token }]);
+  }, [fetchFirecrawlKeys, persistFirecrawl]);
+
+  const removeFirecrawlKey = useCallback(async (account: string) => {
+    const current = await fetchFirecrawlKeys();
+    const next = current.filter((k) => k.account !== account);
+    await persistFirecrawl(next);
+  }, [fetchFirecrawlKeys, persistFirecrawl]);
 
   const disconnect = useCallback(async (providerId: AIProviderId) => {
     const { error } = await supabase.from("ai_connections").delete().eq("provider_id", providerId);
@@ -170,6 +282,19 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
   const runQuery = useCallback<Ctx["runQuery"]>(async ({ module, prompt, providerId }) => {
     const id = `q_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     const provider = providerId ?? activeProvider ?? "chatgpt";
+
+    // Cadena de modelos: empieza por el proveedor seleccionado y añade los demás
+    // proveedores LLM activos como fallback ante 429/402.
+    const activeLlmIds = connections
+      .filter((c) => c.status === "active")
+      .map((c) => c.providerId)
+      .filter((pid) => PROVIDER_MODEL[pid]);
+    const ordered: AIProviderId[] = [
+      provider,
+      ...activeLlmIds.filter((pid) => pid !== provider),
+    ];
+    const models = Array.from(new Set(ordered.map((pid) => PROVIDER_MODEL[pid]).filter(Boolean))) as string[];
+
     const pending: QueryRecord = {
       id, module, providerId: provider, prompt, response: "", status: "pending",
       durationMs: 0, createdAt: new Date().toISOString(),
@@ -180,7 +305,7 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
     let response = "";
     let status: QueryRecord["status"] = "success";
     try {
-      const { text } = await generateAiResponse({ data: { prompt } });
+      const { text } = await generateAiResponse({ data: { prompt, models: models.length ? models : undefined } });
       response = text;
     } catch (err) {
       status = "error";
@@ -189,7 +314,7 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
     const finished: QueryRecord = { ...pending, response, status, durationMs: Date.now() - start };
     setHistory((h) => h.map((x) => (x.id === id ? finished : x)));
     return finished;
-  }, [activeProvider]);
+  }, [activeProvider, connections]);
 
   const upsertPrompt = useCallback<Ctx["upsertPrompt"]>(async (p) => {
     if (p.id) {
@@ -255,9 +380,6 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
           filled = filled.replace(new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, "g"), v);
         }
       }
-      // If the template has no {{input}} placeholder, append the user's input
-      // as the actual data to process so the IA ejecuta la consulta en vez de
-      // pedir de nuevo los parámetros.
       if (!hasInputPlaceholder && input && input.trim()) {
         filled = `${filled}\n\n---\nDatos de entrada proporcionados por el usuario (úsalos directamente, NO vuelvas a pedirlos):\n${input}\n\nEjecuta ahora la consulta completa y devuelve el resultado final solicitado.`;
       }
@@ -275,10 +397,10 @@ export function AIManagerProvider({ children }: { children: ReactNode }) {
   const value = useMemo<Ctx>(
     () => ({
       connections, activeProvider, history, prompts, loading,
-      connect, disconnect, setActiveProvider, runQuery, runModule,
+      connect, addFirecrawlKey, removeFirecrawlKey, disconnect, setActiveProvider, runQuery, runModule,
       upsertPrompt, deletePrompt, getPromptByModule,
     }),
-    [connections, activeProvider, history, prompts, loading, connect, disconnect, setActiveProvider, runQuery, runModule, upsertPrompt, deletePrompt, getPromptByModule],
+    [connections, activeProvider, history, prompts, loading, connect, addFirecrawlKey, removeFirecrawlKey, disconnect, setActiveProvider, runQuery, runModule, upsertPrompt, deletePrompt, getPromptByModule],
   );
 
   return <AIContext.Provider value={value}>{children}</AIContext.Provider>;
